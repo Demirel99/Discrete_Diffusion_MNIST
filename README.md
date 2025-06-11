@@ -95,7 +95,3 @@ To create a GIF like the one above, use the `visualize_denoising.py` script. Thi
 # Ensure the timesteps here match the ones used for training
 python visualize_denoising.py <path_to_checkpoint.pth> --timesteps 200 --out denoising_process.gif
 ```
-
-## Reference
-
-> Austin, J., Johnson, D. D., Ho, J., Tarlow, D., & van den Berg, R. (2021). *Structured Denoising Diffusion Models in Discrete State-Spaces*. In Advances in Neural Information Processing Systems. [arXiv:2107.03006](https://arxiv.org/abs/2107.03006).
