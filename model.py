@@ -4,9 +4,6 @@ import torch.nn as nn
 import math
 
 class SinusoidalPositionEmbeddings(nn.Module):
-    """
-    Module for sinusoidal position embeddings, used to encode the timestep.
-    """
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
@@ -37,56 +34,43 @@ class Block(nn.Module):
         return h
 
 class UNet(nn.Module):
-    """
-    A simple U-Net model for the diffusion process.
-    """
-    def __init__(self, in_channels=1, out_channels=1, time_emb_dim=32):
+    def __init__(self, in_channels=1, time_emb_dim=32, num_classes=2): # CHANGED
         super().__init__()
         
-        # Time embedding
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim),
             nn.ReLU(),
         )
 
-        # Downsampling path
         self.down1 = Block(in_channels, 64, time_emb_dim)
         self.pool1 = nn.MaxPool2d(2)
         self.down2 = Block(64, 128, time_emb_dim)
         self.pool2 = nn.MaxPool2d(2)
-
-        # Bottleneck
         self.bot1 = Block(128, 256, time_emb_dim)
-
-        # Upsampling path
         self.upconv1 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.up1 = Block(256, 128, time_emb_dim) # 128 from skip + 128 from upconv
+        self.up1 = Block(256, 128, time_emb_dim)
         self.upconv2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.up2 = Block(128, 64, time_emb_dim)  # 64 from skip + 64 from upconv
-
-        # Output layer
-        self.out = nn.Conv2d(64, out_channels, kernel_size=1)
+        self.up2 = Block(128, 64, time_emb_dim)
+        
+        # CHANGED: Output layer now produces logits for each class
+        self.out = nn.Conv2d(64, num_classes, kernel_size=1)
 
     def forward(self, x, t):
+        # NEW: Scale input from {0, 1} to {-1, 1} for better network performance
+        x = x * 2 - 1
+        
         t = self.time_mlp(t)
-
-        # Downsample
         x1 = self.down1(x, t)
         p1 = self.pool1(x1)
         x2 = self.down2(p1, t)
         p2 = self.pool2(x2)
-
-        # Bottleneck
         b = self.bot1(p2, t)
-
-        # Upsample
         u1 = self.upconv1(b)
-        u1 = torch.cat([u1, x2], dim=1) # Skip connection
+        u1 = torch.cat([u1, x2], dim=1)
         u1 = self.up1(u1, t)
-        
         u2 = self.upconv2(u1)
-        u2 = torch.cat([u2, x1], dim=1) # Skip connection
+        u2 = torch.cat([u2, x1], dim=1)
         u2 = self.up2(u2, t)
 
-        return self.out(u2)
+        return self.out(u2) # Output is [B, K, H, W] logits

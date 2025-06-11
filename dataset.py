@@ -1,4 +1,4 @@
-# file: dataset.py (Corrected)
+# file: dataset.py
 import torch
 from torchvision.datasets import MNIST
 import torchvision.transforms as transforms

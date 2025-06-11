@@ -1,114 +1,179 @@
 # file: diffusion.py
 import torch
 import torch.nn.functional as F
-
-def linear_beta_schedule(timesteps, beta_start=0.0001, beta_end=0.02):
-    return torch.linspace(beta_start, beta_end, timesteps)
+from tqdm.auto import tqdm
 
 class DiscreteDiffusion:
-    def __init__(self, timesteps=1000, beta_schedule='linear'):
-        self.timesteps = timesteps
+    def __init__(self, timesteps=1000, beta_start=0.0001, beta_end=0.02, num_classes=2):
+        self.num_timesteps = timesteps
+        self.num_classes = num_classes
         
-        if beta_schedule == 'linear':
-            self.betas = linear_beta_schedule(timesteps)
-        else:
-            raise NotImplementedError(f"beta_schedule {beta_schedule} not implemented")
+        # Define the beta schedule
+        self.betas = torch.linspace(beta_start, beta_end, timesteps)
+        
+        # Pre-calculate the transition matrices Q_t = q(x_t | x_{t-1})
+        # For binary data (K=2), the uniform transition matrix is simple:
+        # Q_t = [[1 - beta, beta], [beta, 1 - beta]]
+        # We simplify to: Q_t = [[1 - b/2, b/2], [b/2, 1 - b/2]]
+        q_one_step = torch.zeros(timesteps, num_classes, num_classes)
+        q_one_step[:, 0, 0] = 1 - self.betas / 2
+        q_one_step[:, 0, 1] = self.betas / 2
+        q_one_step[:, 1, 0] = self.betas / 2
+        q_one_step[:, 1, 1] = 1 - self.betas / 2
+        self.q_one_step = q_one_step
 
-        self.alphas = 1. - self.betas
-        self.alpha_bars = torch.cumprod(self.alphas, axis=0)
+        # Pre-calculate the cumulative transition matrices bar_Q_t = q(x_t | x_0)
+        # bar_Q_t = Q_1 * Q_2 * ... * Q_t
+        self.q_bar = torch.zeros(timesteps, num_classes, num_classes)
+        q_bar_t = torch.eye(num_classes)
+        for t in range(timesteps):
+            q_bar_t = torch.matmul(q_bar_t, self.q_one_step[t])
+            self.q_bar[t] = q_bar_t
 
     def to(self, device):
         self.betas = self.betas.to(device)
-        self.alphas = self.alphas.to(device)
-        self.alpha_bars = self.alpha_bars.to(device)
+        self.q_one_step = self.q_one_step.to(device)
+        self.q_bar = self.q_bar.to(device)
         return self
 
     def q_sample(self, x_start, t):
-        """
-        Forward process: q(x_t | x_0).
-        This is a simplification that uses the continuous noise formulation and then binarizes.
-        It's a practical approach that works well for this problem.
-        """
-        noise = torch.randn_like(x_start)
-        # Convert binary {0, 1} to {-1, 1} for better compatibility with standard DDPM noise
-        x_start_scaled = x_start * 2 - 1
+      """ Corrupt x_start to x_t using the transition matrix q(x_t | x_0). """
+      # x_start is [B, C, H, W] with values in {0, 1}
+      # t is [B]
+      
+      # --- START OF FIX ---
+      batch_size, channels, height, width = x_start.shape
+      num_pixels = channels * height * width
+
+      # Expand t to match the number of pixels for each image in the batch.
+      # From [B] to [B * N] where N is the number of pixels.
+      t_expanded = t.repeat_interleave(num_pixels) # Shape: [128 * 1024]
+
+      # Get the corresponding transition matrices for each pixel.
+      q_bar_t_expanded = self.q_bar[t_expanded] # Shape: [B*N, K, K]
+
+      # Flatten the starting image pixels to a 1D tensor of initial states.
+      x_start_pixels = x_start.long().flatten() # Shape: [B*N]
+      
+      # For each pixel, we need its corresponding transition probability vector.
+      # This is equivalent to: q_bar_t_expanded[i, x_start_pixels[i], :] for each i.
+      # We can do this efficiently using advanced indexing with torch.arange.
+      pixel_indices = torch.arange(len(x_start_pixels), device=x_start.device)
+      probs = q_bar_t_expanded[pixel_indices, x_start_pixels] # Shape: [B*N, K]
+      
+      # --- END OF FIX ---
+      
+      # Sample from the categorical distribution for each pixel
+      noisy_pixels = torch.multinomial(probs, num_samples=1).squeeze(1)
+      
+      return noisy_pixels.view(x_start.shape).float()
+
+    def q_posterior_logits(self, x_t, x_0, t):
+      """ 
+      Calculate logits of q(x_{t-1} | x_t, x_0). 
+      This is the fully vectorized version.
+      """
+      # Using Bayes' theorem:
+      # q(x_{t-1} | x_t, x_0) ∝ q(x_t | x_{t-1}) * q(x_{t-1} | x_0)
+      
+      # --- START OF FIX ---
+      B, C, H, W = x_t.shape
+      num_pixels = C * H * W
+      
+      # --- Term 1: log( q(x_t | x_{t-1}) ) ---
+      # Get the transition matrix Q_t for each image in the batch
+      q_t_batch = self.q_one_step[t]  # [B, K, K]
+      # Expand to have a matrix for each pixel
+      q_t_expanded = q_t_batch.repeat_interleave(num_pixels, dim=0) # [B*N, K, K]
+      
+      # Get the value of each pixel in x_t
+      xt_pixels = x_t.long().flatten() # [B*N]
+      
+      # For each pixel, we need the column from its transition matrix that corresponds to its value xt_pixels
+      # This gives us p(x_t=xt_pixels[i] | x_{t-1}=k) for each pixel i and for each possible previous state k.
+      fact1_probs = q_t_expanded[torch.arange(len(xt_pixels)), :, xt_pixels] # [B*N, K]
+      
+      
+      # --- Term 2: log( q(x_{t-1} | x_0) ) ---
+      # Handle the t=0 edge case where t-1 = -1
+      t_minus_1 = t - 1
+      # For t=0, q(x_{-1} | x_0) is an identity transition (x_{-1} = x_0)
+      q_bar_t_minus_1_batch = torch.where(
+          t_minus_1.view(-1, 1, 1) < 0,
+          torch.eye(self.num_classes, device=x_t.device).expand(B, -1, -1),
+          self.q_bar[t_minus_1]
+      ) # [B, K, K]
+      
+      # Expand to have a matrix for each pixel
+      q_bar_t_minus_1_expanded = q_bar_t_minus_1_batch.repeat_interleave(num_pixels, dim=0) # [B*N, K, K]
+      
+      # Get the value of each pixel in x_0
+      x0_pixels = x_0.long().flatten() # [B*N]
+      
+      # For each pixel, we need the row from its cumulative transition matrix that corresponds to its value x0_pixels
+      # This gives us p(x_{t-1}=k | x_0=x0_pixels[i]) for each pixel i and for each possible state k.
+      fact2_probs = q_bar_t_minus_1_expanded[torch.arange(len(x0_pixels)), x0_pixels, :] # [B*N, K]
+      
+      # --- Combine and Reshape ---
+      # The log-probabilities are the sum of the log-factors
+      logits_flat = torch.log(fact1_probs + 1e-20) + torch.log(fact2_probs + 1e-20) # [B*N, K]
+      
+      # Reshape back to image format with class dimension: [B, K, H, W]
+      return logits_flat.view(B, num_pixels, self.num_classes).permute(0, 2, 1).view(B, self.num_classes, H, W)
+      # --- END OF FIX ---
         
-        sqrt_alpha_bar_t = torch.sqrt(self.alpha_bars[t]).view(-1, 1, 1, 1)
-        sqrt_one_minus_alpha_bar_t = torch.sqrt(1. - self.alpha_bars[t]).view(-1, 1, 1, 1)
-        
-        noisy_image_scaled = sqrt_alpha_bar_t * x_start_scaled + sqrt_one_minus_alpha_bar_t * noise
-        
-        # Convert back to {0, 1} by thresholding at 0
-        return (noisy_image_scaled > 0).float()
 
     def compute_loss(self, model, x_start):
-        """
-        Computes the loss for a given batch of images.
-        """
-        t = torch.randint(0, self.timesteps, (x_start.shape[0],), device=x_start.device).long()
+        """ Computes the loss: prediction of x_0 from x_t. """
+        b, c, h, w = x_start.shape
+        # Sample a random timestep for each image in the batch
+        t = torch.randint(0, self.num_timesteps, (b,), device=x_start.device).long()
         
+        # Generate the noisy image x_t
         x_t = self.q_sample(x_start, t)
         
-        # The model predicts the logits for the original image x_0
-        predicted_x_start_logits = model(x_t, t)
+        # Model predicts logits for the original image x_0
+        predicted_x0_logits = model(x_t, t) # Shape: [B, K, H, W]
         
-        # We use BCEWithLogitsLoss because our model outputs logits,
-        # and our target is the original binary image {0, 1}.
-        loss = F.binary_cross_entropy_with_logits(predicted_x_start_logits, x_start)
+        # The target is the original image (class indices)
+        target = x_start.long().squeeze(1) # Shape: [B, H, W]
         
+        loss = F.cross_entropy(predicted_x0_logits, target)
         return loss
 
     @torch.no_grad()
-    def p_sample(self, model, x_t, t):
-        """
-        Reverse process: p(x_{t-1} | x_t).
-        Samples x_{t-1} from the model's prediction.
-        """
-        predicted_x_start_logits = model(x_t, t)
-        predicted_x_start_probs = torch.sigmoid(predicted_x_start_logits)
+    def p_sample(self, model, x_t, t_tensor):
+        """ Sample x_{t-1} from the model's prediction of x_0. """
+        model.eval()
+        t = t_tensor[0].item()
+        
+        # 1. Model predicts the original image x_0
+        predicted_x0_logits = model(x_t, t_tensor)
+        predicted_x0_probs = F.softmax(predicted_x0_logits, dim=1)
+        
+        # Get the most likely x_0
+        predicted_x0 = torch.argmax(predicted_x0_probs, dim=1).unsqueeze(1) # [B, 1, H, W]
 
-        # For the final step, simply threshold the model's prediction
-        # The t tensor will be [0, 0, ..., 0], so we check its first element.
-        if t[0].item() == 0:
-            return (predicted_x_start_probs > 0.5).float()
-
-        # For intermediate steps, use the DDPM posterior formula
-        beta_t = self.betas[t].view(-1, 1, 1, 1)
-        alpha_t = self.alphas[t].view(-1, 1, 1, 1)
-        alpha_bar_t = self.alpha_bars[t].view(-1, 1, 1, 1)
+        # 2. Get posterior logits q(x_{t-1} | x_t, predicted_x_0)
+        posterior_logits = self.q_posterior_logits(x_t, predicted_x0, t_tensor)
         
-        # We need alpha_bar for t-1. Handle edge case t=0 (already done above).
-        alpha_bar_t_prev = self.alpha_bars[t-1].view(-1, 1, 1, 1)
+        # 3. Sample x_{t-1} from the posterior distribution
+        posterior_probs = F.softmax(posterior_logits, dim=1)
         
-        # Scale predictions and input to {-1, 1} space for formula
-        predicted_x_start_scaled = predicted_x_start_probs * 2 - 1
-        x_t_scaled = x_t * 2 - 1
-
-        # Posterior mean calculation from the DDPM paper
-        posterior_mean_coef1 = (torch.sqrt(alpha_bar_t_prev) * beta_t) / (1. - alpha_bar_t)
-        posterior_mean_coef2 = (torch.sqrt(alpha_t) * (1. - alpha_bar_t_prev)) / (1. - alpha_bar_t)
-        posterior_mean_scaled = posterior_mean_coef1 * predicted_x_start_scaled + posterior_mean_coef2 * x_t_scaled
+        b, k, h, w = posterior_probs.shape
+        sampled_pixels = torch.multinomial(posterior_probs.permute(0, 2, 3, 1).reshape(-1, k), 1).squeeze(1)
         
-        # Add noise
-        noise = torch.randn_like(x_t)
-        posterior_variance = (beta_t * (1. - alpha_bar_t_prev)) / (1. - alpha_bar_t)
-        
-        x_t_minus_1_scaled = posterior_mean_scaled + torch.sqrt(posterior_variance) * noise
-        
-        # Convert back to {0, 1} by thresholding
-        return (x_t_minus_1_scaled > 0).float()
+        return sampled_pixels.view(b, h, w).unsqueeze(1).float()
 
     @torch.no_grad()
     def sample(self, model, image_size, batch_size=16, channels=1):
-        """
-        Generates new images.
-        """
+        """ Generates new images by running the full reverse diffusion process. """
         device = next(model.parameters()).device
         
         # Start with pure random binary noise
-        img = torch.randint(0, 2, (batch_size, channels, image_size, image_size), device=device).float()
+        img = torch.randint(0, self.num_classes, (batch_size, channels, image_size, image_size), device=device).float()
         
-        for i in reversed(range(self.timesteps)):
+        for i in tqdm(reversed(range(self.num_timesteps)), desc="Sampling", total=self.num_timesteps):
             t = torch.full((batch_size,), i, device=device, dtype=torch.long)
             img = self.p_sample(model, img, t)
             
